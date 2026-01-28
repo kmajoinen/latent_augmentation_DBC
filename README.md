@@ -1,3 +1,13 @@
+# Latent data augmentation for bisimulation-based representation learning
+
+This repository contains an implementation of a latent data augmentation for
+the bisimulation agent. The purpose is to implement a DrQ-style data augmentation scheme in the latent space to improve Q-value estimation.
+Our methodolgy is implemented into a fork of the repository of Amy Zhang (their README below).
+
+The project uses Weights & Biases to log the results instead of the logger used by the original project, thought that implementation is present but commented out. 
+
+---
+
 # Learning Invariant Representations for Reinforcement Learning without Reconstruction
 
 ## Requirements
