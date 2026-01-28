@@ -13,6 +13,43 @@ import utils
 from sac_ae import  Actor, Critic, LOG_FREQ
 from transition_model import make_transition_model
 
+def augment_latent(z, mode="jitter", strength=0.01, running_std=None, neighbor_z=None, alpha=0.2, p=0.1):
+        """
+        Augment latent vectors for bisimulation-encoder SAC.
+
+        Args:
+            z: torch.Tensor, shape (B, D)
+            mode: str, one of ["jitter", "empirical_jitter", "mixup", "dropout"]
+            strength: float, noise std or scale factor
+            running_std: torch.Tensor (D,) optional, per-dim std for 'empirical_jitter'
+            neighbor_z: torch.Tensor (B, D) optional, neighbor latents for 'mixup'
+            alpha: float, beta distribution parameter for 'mixup'
+            p: float, dropout probability for 'dropout'
+        Returns:
+            z_aug: torch.Tensor, same shape as z
+        """
+        if mode == "jitter":  # isotropic Gaussian noise
+            noise = strength * torch.randn_like(z)
+            return z + noise
+
+        elif mode == "empirical_jitter":
+            if running_std is None:
+                raise ValueError("running_std required for empirical_jitter")
+            noise = strength * running_std * torch.randn_like(z)
+            return z + noise
+
+        elif mode == "mixup":
+            if neighbor_z is None:
+                raise ValueError("neighbor_z required for mixup")
+            lam = np.random.beta(alpha, alpha)
+            return lam * z + (1 - lam) * neighbor_z
+
+        elif mode == "dropout":
+            mask = (torch.rand_like(z) > p).float()
+            return z * mask
+
+        else:
+            raise ValueError(f"Unknown augmentation mode: {mode}")
 
 class BisimAgent(object):
     """Bisimulation metric algorithm."""
@@ -48,7 +85,15 @@ class BisimAgent(object):
         decoder_weight_lambda=0.0,
         num_layers=4,
         num_filters=32,
-        bisim_coef=0.5
+        bisim_coef=0.5,
+        augment=False,
+        augment_method="jitter",
+        jitter_strength=0.01,
+        aug_K=1,
+        aug_M=1,
+        run=None,
+        wb=False,
+        naive_augment=False
     ):
         self.device = device
         self.discount = discount
@@ -60,21 +105,29 @@ class BisimAgent(object):
         self.decoder_latent_lambda = decoder_latent_lambda
         self.transition_model_type = transition_model_type
         self.bisim_coef = bisim_coef
+        self.augment = augment
+        self.augment_method = augment_method
+        self.jitter_strenght = jitter_strength
+        self.K = aug_K
+        self.M = aug_M
+        self.run = run
+        self.wb = wb
+        self.naive_augment = naive_augment
 
         self.actor = Actor(
             obs_shape, action_shape, hidden_dim, encoder_type,
             encoder_feature_dim, actor_log_std_min, actor_log_std_max,
-            num_layers, num_filters, encoder_stride
+            num_layers, num_filters, encoder_stride, augment, augment_method, jitter_strength, naive_augment
         ).to(device)
 
         self.critic = Critic(
             obs_shape, action_shape, hidden_dim, encoder_type,
-            encoder_feature_dim, num_layers, num_filters, encoder_stride
+            encoder_feature_dim, num_layers, num_filters, encoder_stride, augment, augment_method, jitter_strength, naive_augment
         ).to(device)
 
         self.critic_target = Critic(
             obs_shape, action_shape, hidden_dim, encoder_type,
-            encoder_feature_dim, num_layers, num_filters, encoder_stride
+            encoder_feature_dim, num_layers, num_filters, encoder_stride, augment, augment_method, jitter_strength, naive_augment
         ).to(device)
 
         self.critic_target.load_state_dict(self.critic.state_dict())
@@ -151,54 +204,168 @@ class BisimAgent(object):
             return pi.cpu().data.numpy().flatten()
 
     def update_critic(self, obs, action, reward, next_obs, not_done, L, step):
-        with torch.no_grad():
-            _, policy_action, log_pi, _ = self.actor(next_obs)
-            target_Q1, target_Q2 = self.critic_target(next_obs, policy_action)
-            target_V = torch.min(target_Q1,
-                                 target_Q2) - self.alpha.detach() * log_pi
-            target_Q = reward + (not_done * self.discount * target_V)
+        
+        if self.augment:
+            # target_Q_aug = []
+            # for _ in range(self.K):
+            #     with torch.no_grad():
+            #         next_enc_obs = self.critic.encoder(next_obs)
+            #         next_obs_aug = augment_latent(next_enc_obs)
 
-        # get current Q estimates
-        current_Q1, current_Q2 = self.critic(obs, action, detach_encoder=False)
-        critic_loss = F.mse_loss(current_Q1,
-                                 target_Q) + F.mse_loss(current_Q2, target_Q)
-        L.log('train_critic/loss', critic_loss, step)
+            #         _, policy_action, log_pi, _ = self.actor(next_obs_aug, skip_encoder=True)
+            #         target_Q1, target_Q2 = self.critic_target(next_obs_aug, policy_action, skip_encoder=True)
+            #         target_V = torch.min(target_Q1,
+            #                             target_Q2) - self.alpha.detach() * log_pi
+            #         target_Q = reward + (not_done * self.discount * target_V)
 
+            #         target_Q_aug.append(target_Q)
+
+
+            # target_Q = torch.stack(target_Q_aug).sum(dim=0) / self.K
+
+            # # get current Q estimates
+            # current_Q1_aug = []
+            # current_Q2_aug = []
+            # for _ in range(self.M):
+            #     enc_obs = self.critic.encoder(obs)
+            #     obs_aug = augment_latent(enc_obs)
+            #     current_Q1, current_Q2 = self.critic(obs_aug, action, detach_encoder=False, skip_encoder=True)
+            #     current_Q1_aug.append(current_Q1)
+            #     current_Q2_aug.append(current_Q2)
+
+            # current_Q1 = torch.stack(current_Q1_aug).sum(dim=0)  / self.M
+            # current_Q2 = torch.stack(current_Q2_aug).sum(dim=0)  / self.M
+
+            # q1_loss = F.mse_loss(current_Q1, target_Q)
+            # q2_loss = F.mse_loss(current_Q2, target_Q)
+            lat_obs, lat_obs_aug = obs[0],obs[1]
+            lat_next_obs, lat_next_obs_aug = next_obs[0], next_obs[1]
+            with torch.no_grad():
+                
+                _, policy_action, log_pi, _ = self.actor(lat_next_obs, skip_encoder=True)
+                target_Q1, target_Q2 = self.critic_target(lat_next_obs, policy_action, skip_encoder=True)
+                target_V = torch.min(target_Q1,
+                                        target_Q2) - self.alpha.detach() * log_pi
+                target_Q = reward + (not_done * self.discount * target_V)
+
+                _, policy_action_aug, log_pi_aug, _ = self.actor(lat_next_obs_aug, skip_encoder=True)
+                target_Q1, target_Q2 = self.critic_target(lat_next_obs_aug, policy_action_aug,skip_encoder=True)
+                target_V = torch.min(
+                    target_Q1, target_Q2) - self.alpha.detach() * log_pi_aug
+                target_Q_aug = reward + (not_done * self.discount * target_V)
+
+                target_Q = (target_Q + target_Q_aug) / 2
+
+            current_Q1, current_Q2 = self.critic(lat_obs, action, skip_encoder=True)
+            q1_loss = F.mse_loss(current_Q1, target_Q)
+            q2_loss = F.mse_loss(current_Q2, target_Q)
+            critic_loss = q1_loss + q2_loss
+
+            Q1_aug, Q2_aug = self.critic(lat_obs_aug, action, skip_encoder=True)
+            q1_aug_loss = F.mse_loss(Q1_aug, target_Q)
+            q2_aug_loss = F.mse_loss(Q2_aug, target_Q)
+
+            critic_loss += q1_aug_loss + q2_aug_loss
+        else:
+            with torch.no_grad():
+                _, policy_action, log_pi, _ = self.actor(next_obs)
+                target_Q1, target_Q2 = self.critic_target(next_obs, policy_action)
+                target_V = torch.min(target_Q1,
+                                    target_Q2) - self.alpha.detach() * log_pi
+                target_Q = reward + (not_done * self.discount * target_V)
+
+            # get current Q estimates
+            current_Q1, current_Q2 = self.critic(obs, action, detach_encoder=False)
+            q1_loss = F.mse_loss(current_Q1, target_Q) 
+            q2_loss = F.mse_loss(current_Q2, target_Q)
+            critic_loss = q1_loss + q2_loss
         # Optimize the critic
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
         self.critic_optimizer.step()
 
-        self.critic.log(L, step)
+        #self.critic.log(L, step)
+
+        # self.critic.log(self.run, step)
+
+        if self.run is not None:
+            self.run.define_metric("critic/Critic_loss", step_metric="Global_step")
+            self.run.log({"critic/Critic_loss": critic_loss.item() / 2.0,
+                        "Global_step":  step})
+            self.run.define_metric("critic/Q1_value", step_metric="Global_step")
+            self.run.define_metric("critic/Q2_value", step_metric="Global_step")
+            self.run.define_metric("critic/Q1_loss", step_metric="Global_step")
+            self.run.define_metric("critic/Q2_loss", step_metric="Global_step")
+            self.run.define_metric("critic/Q_target_value", step_metric="Global_step")
+            self.run.log(
+            {
+            "critic/Q1_value": current_Q1.mean().item(),
+            "critic/Q2_value": current_Q2.mean().item(),
+            "critic/Q1_loss": q1_loss.item(),
+            "critic/Q2_loss": q2_loss.item(),
+            "critic/Q_target_value" : target_Q.mean().item(),
+            "Global_step": step
+            })
+            if self.augment:
+                self.run.define_metric("critic/Q1_aug_value", step_metric="Global_step")
+                self.run.define_metric("critic/Q2_aug_value", step_metric="Global_step")
+                self.run.define_metric("critic/Q1_aug_loss", step_metric="Global_step")
+                self.run.define_metric("critic/Q2_aug_loss", step_metric="Global_step")
+                self.run.log(
+                {
+                "critic/Q1_aug_value": Q1_aug.mean().item(),
+                "critic/Q2_aug_value": Q2_aug.mean().item(),
+                "critic/Q1_aug_loss": q1_aug_loss.item(),
+                "critic/Q2_aug_loss": q2_aug_loss.item(),
+                "Global_step": step
+                })
 
     def update_actor_and_alpha(self, obs, L, step):
         # detach encoder, so we don't update it with the actor loss
-        _, pi, log_pi, log_std = self.actor(obs, detach_encoder=True)
-        actor_Q1, actor_Q2 = self.critic(obs, pi, detach_encoder=True)
+        if self.augment:
+            _, pi, log_pi, log_std = self.actor(obs, detach_encoder=True, skip_encoder=True)
+            actor_Q1, actor_Q2 = self.critic(obs, pi, detach_encoder=True, skip_encoder=True)
+        else:
+            _, pi, log_pi, log_std = self.actor(obs, detach_encoder=True)
+            actor_Q1, actor_Q2 = self.critic(obs, pi, detach_encoder=True)
 
         actor_Q = torch.min(actor_Q1, actor_Q2)
         actor_loss = (self.alpha.detach() * log_pi - actor_Q).mean()
 
-        L.log('train_actor/loss', actor_loss, step)
-        L.log('train_actor/target_entropy', self.target_entropy, step)
+        #L.log('train_actor/loss', actor_loss, step)
+        #L.log('train_actor/target_entropy', self.target_entropy, step)
         entropy = 0.5 * log_std.shape[1] * (1.0 + np.log(2 * np.pi)
                                             ) + log_std.sum(dim=-1)
-        L.log('train_actor/entropy', entropy.mean(), step)
+        #L.log('train_actor/entropy', entropy.mean(), step)
 
         # optimize the actor
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         self.actor_optimizer.step()
 
-        self.actor.log(L, step)
+        #self.actor.log(L, step)
 
         self.log_alpha_optimizer.zero_grad()
         alpha_loss = (self.alpha *
                       (-log_pi - self.target_entropy).detach()).mean()
-        L.log('train_alpha/loss', alpha_loss, step)
-        L.log('train_alpha/value', self.alpha, step)
+        #L.log('train_alpha/loss', alpha_loss, step)
+        #L.log('train_alpha/value', self.alpha, step)
         alpha_loss.backward()
         self.log_alpha_optimizer.step()
+        if self.run is not None:
+            self.run.define_metric("actor/Actor_loss", step_metric="Global_step")
+            self.run.define_metric("actor/Target_entropy", step_metric="Global_step")
+            self.run.define_metric("actor/Entropy", step_metric="Global_step")
+            self.run.define_metric("actor/Alpha_loss", step_metric="Global_step")
+            self.run.define_metric("actor/Alpha_value", step_metric="Global_step")
+            self.run.log({
+                "actor/Actor_loss": actor_loss.item(),
+                "actor/Target_entropy": self.target_entropy,
+                "actor/Entropy": entropy.mean().item(),
+                "actor/Alpha_loss": alpha_loss.item(),
+                "actor/Alpha_value": self.alpha.item(),
+                "Global_step": step
+            })
 
     def update_encoder(self, obs, action, reward, L, step):
         h = self.critic.encoder(obs)            
@@ -238,7 +405,21 @@ class BisimAgent(object):
 
         bisimilarity = r_dist + self.discount * transition_dist
         loss = (z_dist - bisimilarity).pow(2).mean()
-        L.log('train_ae/encoder_loss', loss, step)
+        #L.log('train_ae/encoder_loss', loss, step)
+        if self.run is not None:
+            self.run.define_metric("Reward_dist_loss", step_metric="Global_step")
+            self.run.define_metric("Latent_dist_loss", step_metric="Global_step")
+            self.run.define_metric("Total_loss", step_metric="Global_step")
+            self.run.define_metric("Bisimilarity", step_metric="Global_step")
+            self.run.define_metric("Transition_distance", step_metric="Global_step")
+            self.run.log({
+                "Reward_dist_loss": r_dist.mean().item(),
+                "Latent_dist_loss": z_dist.mean().item(),
+                "Total_loss": loss.item(),
+                "Bisimilarity": bisimilarity.mean().item(),
+                "Transition_distance": transition_dist.mean().item(),
+                "Global_step": step
+            })
         return loss
 
     def update_transition_reward_model(self, obs, action, next_obs, reward, L, step):
@@ -250,7 +431,7 @@ class BisimAgent(object):
         next_h = self.critic.encoder(next_obs)
         diff = (pred_next_latent_mu - next_h.detach()) / pred_next_latent_sigma
         loss = torch.mean(0.5 * diff.pow(2) + torch.log(pred_next_latent_sigma))
-        L.log('train_ae/transition_loss', loss, step)
+        #L.log('train_ae/transition_loss', loss, step)
 
         pred_next_latent = self.transition_model.sample_prediction(torch.cat([h, action], dim=1))
         pred_next_reward = self.reward_decoder(pred_next_latent)
@@ -261,9 +442,21 @@ class BisimAgent(object):
     def update(self, replay_buffer, L, step):
         obs, action, _, reward, next_obs, not_done = replay_buffer.sample()
 
-        L.log('train/batch_reward', reward.mean(), step)
+        #L.log('train/batch_reward', reward.mean(), step)
+        if self.augment:
+            obs_enc = self.critic.encoder(obs)
+            lat_obs = augment_latent(obs_enc)
+            lat_obs_aug = augment_latent(obs_enc)
 
-        self.update_critic(obs, action, reward, next_obs, not_done, L, step)
+            next_obs_enc = self.critic.encoder(next_obs)
+            next_lat_obs = augment_latent(next_obs_enc)
+            next_lat_obs_aug = augment_latent(next_obs_enc)
+
+            obses = [lat_obs, lat_obs_aug]
+            next_obses = [next_lat_obs, next_lat_obs_aug]
+            self.update_critic(obses, action, reward, next_obses, not_done, L, step)
+        else:
+            self.update_critic(obs, action, reward, next_obs, not_done, L, step)
         transition_reward_loss = self.update_transition_reward_model(obs, action, next_obs, reward, L, step)
         encoder_loss = self.update_encoder(obs, action, reward, L, step)
         total_loss = self.bisim_coef * encoder_loss + transition_reward_loss
@@ -274,7 +467,10 @@ class BisimAgent(object):
         self.decoder_optimizer.step()
 
         if step % self.actor_update_freq == 0:
-            self.update_actor_and_alpha(obs, L, step)
+            if self.augment:
+                self.update_actor_and_alpha(lat_obs.detach(), L, step)
+            else:
+                self.update_actor_and_alpha(obs, L, step)
 
         if step % self.critic_target_update_freq == 0:
             utils.soft_update_params(
@@ -287,6 +483,50 @@ class BisimAgent(object):
                 self.critic.encoder, self.critic_target.encoder,
                 self.encoder_tau
             )
+
+    def update_encoder_only(self, obs, action, reward):
+        h = self.critic.encoder(obs)            
+
+        # Sample random states across episodes at random
+        batch_size = obs.size(0)
+        perm = np.random.permutation(batch_size)
+        h2 = h[perm]
+
+        with torch.no_grad():
+            # action, _, _, _ = self.actor(obs, compute_pi=False, compute_log_pi=False)
+            pred_next_latent_mu1, pred_next_latent_sigma1 = self.transition_model(torch.cat([h, action], dim=1))
+            # reward = self.reward_decoder(pred_next_latent_mu1)
+            reward2 = reward[perm]
+        if pred_next_latent_sigma1 is None:
+            pred_next_latent_sigma1 = torch.zeros_like(pred_next_latent_mu1)
+        if pred_next_latent_mu1.ndim == 2:  # shape (B, Z), no ensemble
+            pred_next_latent_mu2 = pred_next_latent_mu1[perm]
+            pred_next_latent_sigma2 = pred_next_latent_sigma1[perm]
+        elif pred_next_latent_mu1.ndim == 3:  # shape (B, E, Z), using an ensemble
+            pred_next_latent_mu2 = pred_next_latent_mu1[:, perm]
+            pred_next_latent_sigma2 = pred_next_latent_sigma1[:, perm]
+        else:
+            raise NotImplementedError
+
+        z_dist = F.smooth_l1_loss(h, h2, reduction='none')
+        r_dist = F.smooth_l1_loss(reward, reward2, reduction='none')
+        if self.transition_model_type == '':
+            transition_dist = F.smooth_l1_loss(pred_next_latent_mu1, pred_next_latent_mu2, reduction='none')
+        else:
+            transition_dist = torch.sqrt(
+                (pred_next_latent_mu1 - pred_next_latent_mu2).pow(2) +
+                (pred_next_latent_sigma1 - pred_next_latent_sigma2).pow(2)
+            )
+            # transition_dist  = F.smooth_l1_loss(pred_next_latent_mu1, pred_next_latent_mu2, reduction='none') \
+            #     +  F.smooth_l1_loss(pred_next_latent_sigma1, pred_next_latent_sigma2, reduction='none')
+
+        bisimilarity = r_dist + self.discount * transition_dist
+        loss = (z_dist - bisimilarity).pow(2).mean()
+        self.encoder_optimizer.zero_grad()
+        self.decoder_optimizer.zero_grad()
+        loss.backward()
+        self.encoder_optimizer.step()
+        self.decoder_optimizer.step()
 
             
     def save(self, model_dir, step):
@@ -311,4 +551,3 @@ class BisimAgent(object):
         self.reward_decoder.load_state_dict(
             torch.load('%s/reward_decoder_%s.pt' % (model_dir, step))
         )
-

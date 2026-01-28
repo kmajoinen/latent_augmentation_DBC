@@ -92,10 +92,7 @@ def parse_args():
     parser.add_argument('--proj-name', type=str, default="thesis_baselines")
     parser.add_argument('--augment', default=False, action='store_true')
     parser.add_argument('--augment-method', type=str, default="jitter")
-    parser.add_argument('--jitter-strength', default=0.0, type=float)
-    parser.add_argument('--augment-K', default=1, type=int)
-    parser.add_argument('--augment-M', default=1, type=int)
-    parser.add_argument('--naive_augment', default=False, action='store_true')
+    parser.add_argument('--jitter_strength', default=0.0, type=float) # TODO: add other noise params
     args = parser.parse_args()
     return args
 
@@ -169,7 +166,7 @@ def evaluate(env, agent, video, num_episodes, L, step, device=None, embed_viz_di
         print('---------------------------------')
 
 
-def make_agent(obs_shape, action_shape, args, device, run, wb):
+def make_agent(obs_shape, action_shape, args, device):
     if args.agent == 'baseline':
         agent = BaselineAgent(
             obs_shape=obs_shape,
@@ -236,12 +233,7 @@ def make_agent(obs_shape, action_shape, args, device, run, wb):
             bisim_coef=args.bisim_coef,
             augment=args.augment,
             augment_method=args.augment_method,
-            jitter_strength=args.jitter_strength,
-            aug_K=args.augment_K,
-            aug_M=args.augment_M,
-            run=run,
-            wb=wb,
-            naive_augment=args.naive_augment
+            jitter_strength=args.jitter_strength
         )
     elif args.agent == 'deepmdp':
         agent = DeepMDPAgent(
@@ -336,26 +328,12 @@ def main():
 
     wb = args.wandb_sync
     augment = args.augment
-    naive_augment = args.naive_augment
-    distract = (args.img_source is not None)
-    if augment or naive_augment:
+    if augment:
         run_type = "Aug_bisim"
-        if naive_augment:
-            run_type += "_N"
-            run_name = f"{run_type}_{args.domain_name}_{args.task_name}_s-{args.seed}_j-{args.jitter_strength}"
-        if augment:
-            run_type += "_DrQ"
-            if args.augment_method == "dropout":
-                run_name = f"{run_type}_{args.domain_name}_{args.task_name}_s-{args.seed}_DROP"
-            else:
-                run_name = f"{run_type}_{args.domain_name}_{args.task_name}_s-{args.seed}_K-{args.augment_K}-M-{args.augment_M}_j-{args.jitter_strength}"
+        run_name = f"{run_type}_{args.domain_name}_{args.task_name}_s-{args.seed}_aug-{args.jitter_strength}"
     else:
         run_type = "Bisim_baseline"
-        run_name = f"{run_type}_{args.domain_name}_{args.task_name}_s-{args.seed}"
-        if args.discount != 0.99:
-            run_name += f'_d-{args.discount}'
-    if distract:
-        run_name += "_D"
+        run_name = f"{run_type}_{args.domain_name}_{args.task_name}_s-{args.seed}_d-{args.discount}"
     proj_name = args.proj_name
     print(run_name)
     print(f'{run_type} - {proj_name}')
@@ -406,18 +384,15 @@ def main():
         obs_shape=env.observation_space.shape,
         action_shape=env.action_space.shape,
         args=args,
-        device=device,
-        run=run,
-        wb=wb
+        device=device
     )
 
     # L = Logger(args.work_dir, use_tb=args.save_tb)
     L = 1
 
+
     episode, episode_reward, done = 0, 0, True
     start_time = time.time()
-    print("Augment: ", augment)
-    print("Naive Augment: ", naive_augment)
     print(f"Episode - {episode}")
     for step in range(args.num_train_steps):
         if done:
@@ -446,7 +421,7 @@ def main():
                         "Global_step":  step})
 
             obs = env.reset()
-            # print(f"{obs.shape}, {obs.dtype}")
+            print(f"{obs.shape}, {obs.dtype}")
             done = False
             episode_reward = 0
             episode_step = 0
@@ -461,6 +436,11 @@ def main():
         else:
             with utils.eval_mode(agent):
                 action = agent.sample_action(obs)
+
+        # run pretraining encoder update
+        if step < args.init_steps and step > args.batch_size:
+            obs_pre, action_pre, _, reward_pre, _ , _ = replay_buffer.sample()
+            agent.update_encoder_only(obs_pre, action_pre, reward_pre)
 
         # run training update
         if step >= args.init_steps:

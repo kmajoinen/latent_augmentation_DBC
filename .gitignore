@@ -1,0 +1,8 @@
+wandb/
+outputs/
+outfiles/
+log/
+__pycache__/
+distractors/
+distractors/n_body_problem.py
+distractors/render_n_body_problem_envs.py

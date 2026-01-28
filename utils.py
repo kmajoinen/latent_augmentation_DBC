@@ -12,7 +12,6 @@ import os
 from collections import deque
 import random
 
-
 class eval_mode(object):
     def __init__(self, *models):
         self.models = models
@@ -82,7 +81,7 @@ class ReplayBuffer(object):
         obs_dtype = np.float32 if len(obs_shape) == 1 else np.uint8
 
         self.obses = np.empty((capacity, *obs_shape), dtype=obs_dtype)
-        self.k_obses = np.empty((capacity, *obs_shape), dtype=obs_dtype)
+        # self.k_obses = np.empty((capacity, *obs_shape), dtype=obs_dtype)
         self.next_obses = np.empty((capacity, *obs_shape), dtype=obs_dtype)
         self.actions = np.empty((capacity, *action_shape), dtype=np.float32)
         self.curr_rewards = np.empty((capacity, 1), dtype=np.float32)
@@ -91,6 +90,7 @@ class ReplayBuffer(object):
 
         self.idx = 0
         self.last_save = 0
+        self.current_size = 0
         self.full = False
 
     def add(self, obs, action, curr_reward, reward, next_obs, done):
@@ -98,10 +98,11 @@ class ReplayBuffer(object):
         np.copyto(self.actions[self.idx], action)
         np.copyto(self.curr_rewards[self.idx], curr_reward)
         np.copyto(self.rewards[self.idx], reward)
-        np.copyto(self.next_obses[self.idx], next_obs)
+        # np.copyto(self.next_obses[self.idx], next_obs)
         np.copyto(self.not_dones[self.idx], not done)
 
         self.idx = (self.idx + 1) % self.capacity
+        self.current_size = min(self.current_size + 1, self.capacity)
         self.full = self.full or self.idx == 0
 
     def sample(self, k=False):
@@ -113,12 +114,15 @@ class ReplayBuffer(object):
         actions = torch.as_tensor(self.actions[idxs], device=self.device)
         curr_rewards = torch.as_tensor(self.curr_rewards[idxs], device=self.device)
         rewards = torch.as_tensor(self.rewards[idxs], device=self.device)
+        # next_obses = torch.as_tensor(
+        #     self.next_obses[idxs], device=self.device
+        # ).float()
         next_obses = torch.as_tensor(
-            self.next_obses[idxs], device=self.device
+            self.obses[(idxs+1) % self.current_size], device=self.device
         ).float()
         not_dones = torch.as_tensor(self.not_dones[idxs], device=self.device)
-        if k:
-            return obses, actions, rewards, next_obses, not_dones, torch.as_tensor(self.k_obses[idxs], device=self.device)
+        # if k:
+        #     return obses, actions, rewards, next_obses, not_dones, torch.as_tensor(self.k_obses[idxs], device=self.device)
         return obses, actions, curr_rewards, rewards, next_obses, not_dones
 
     def save(self, save_dir):

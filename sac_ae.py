@@ -47,12 +47,50 @@ def weight_init(m):
         gain = nn.init.calculate_gain('relu')
         nn.init.orthogonal_(m.weight.data[:, :, mid, mid], gain)
 
+def augment_latent(z, mode="jitter", strength=0.01, running_std=None, neighbor_z=None, alpha=0.2, p=0.1):
+        """
+        Augment latent vectors for bisimulation-encoder SAC.
+
+        Args:
+            z: torch.Tensor, shape (B, D)
+            mode: str, one of ["jitter", "empirical_jitter", "mixup", "dropout"]
+            strength: float, noise std or scale factor
+            running_std: torch.Tensor (D,) optional, per-dim std for 'empirical_jitter'
+            neighbor_z: torch.Tensor (B, D) optional, neighbor latents for 'mixup'
+            alpha: float, beta distribution parameter for 'mixup'
+            p: float, dropout probability for 'dropout'
+        Returns:
+            z_aug: torch.Tensor, same shape as z
+        """
+        if mode == "jitter":  # isotropic Gaussian noise
+            noise = strength * torch.randn_like(z)
+            return z + noise
+
+        elif mode == "empirical_jitter":
+            if running_std is None:
+                raise ValueError("running_std required for empirical_jitter")
+            noise = strength * running_std * torch.randn_like(z)
+            return z + noise
+
+        elif mode == "mixup":
+            if neighbor_z is None:
+                raise ValueError("neighbor_z required for mixup")
+            lam = np.random.beta(alpha, alpha)
+            return lam * z + (1 - lam) * neighbor_z
+
+        elif mode == "dropout":
+            mask = (torch.rand_like(z) > p).float()
+            return z * mask
+
+        else:
+            raise ValueError(f"Unknown augmentation mode: {mode}")
+
 
 class Actor(nn.Module):
     """MLP actor network."""
     def __init__(
         self, obs_shape, action_shape, hidden_dim, encoder_type,
-        encoder_feature_dim, log_std_min, log_std_max, num_layers, num_filters, stride
+        encoder_feature_dim, log_std_min, log_std_max, num_layers, num_filters, stride, augment, augment_method, jitter_strength, naive_augment
     ):
         super().__init__()
 
@@ -63,6 +101,10 @@ class Actor(nn.Module):
 
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
+        self.augment = augment
+        self.augment_method = augment_method
+        self.jitter_strength = jitter_strength
+        self.naive_augment = naive_augment
 
         self.trunk = nn.Sequential(
             nn.Linear(self.encoder.feature_dim, hidden_dim), nn.ReLU(),
@@ -74,9 +116,19 @@ class Actor(nn.Module):
         self.apply(weight_init)
 
     def forward(
-        self, obs, compute_pi=True, compute_log_pi=True, detach_encoder=False
-    ):
-        obs = self.encoder(obs, detach=detach_encoder)
+        self, obs, compute_pi=True, compute_log_pi=True, detach_encoder=False, skip_encoder=False
+    ):  
+        if not skip_encoder:
+            obs = self.encoder(obs, detach=detach_encoder)
+        if self.naive_augment:
+            obs = augment_latent(obs, strength=self.jitter_strength)
+        # if not skip_encoder and not self.augment:
+        #     obs = self.encoder(obs, detach=detach_encoder)
+        # elif not skip_encoder and self.augment:
+        #     obs = self.encoder(obs, detach=detach_encoder)
+        #     obs = augment_latent(obs, strength=self.jitter_strength)
+        # if self.augment:
+        #     obs = augment_latent(obs, strength=self.jitter_strength)
 
         mu, log_std = self.trunk(obs).chunk(2, dim=-1)
 
@@ -110,12 +162,12 @@ class Actor(nn.Module):
         if step % log_freq != 0:
             return
 
-        for k, v in self.outputs.items():
-            L.log_histogram('train_actor/%s_hist' % k, v, step)
+        # for k, v in self.outputs.items():
+        #     L.log_histogram('train_actor/%s_hist' % k, v, step)
 
-        L.log_param('train_actor/fc1', self.trunk[0], step)
-        L.log_param('train_actor/fc2', self.trunk[2], step)
-        L.log_param('train_actor/fc3', self.trunk[4], step)
+        # L.log_param('train_actor/fc1', self.trunk[0], step)
+        # L.log_param('train_actor/fc2', self.trunk[2], step)
+        # L.log_param('train_actor/fc3', self.trunk[4], step)
 
 
 class QFunction(nn.Module):
@@ -140,7 +192,7 @@ class Critic(nn.Module):
     """Critic network, employes two q-functions."""
     def __init__(
         self, obs_shape, action_shape, hidden_dim, encoder_type,
-        encoder_feature_dim, num_layers, num_filters, stride
+        encoder_feature_dim, num_layers, num_filters, stride, augment, augment_method, jitter_strength, naive_augment
     ):
         super().__init__()
 
@@ -148,6 +200,11 @@ class Critic(nn.Module):
             encoder_type, obs_shape, encoder_feature_dim, num_layers,
             num_filters, stride
         )
+
+        self.augment = augment
+        self.augment_method = augment_method
+        self.jitter_strength = jitter_strength
+        self.naive_augment = naive_augment
 
         self.Q1 = QFunction(
             self.encoder.feature_dim, action_shape[0], hidden_dim
@@ -159,9 +216,13 @@ class Critic(nn.Module):
         self.outputs = dict()
         self.apply(weight_init)
 
-    def forward(self, obs, action, detach_encoder=False):
+    def forward(self, obs, action, detach_encoder=False, skip_encoder=False):
         # detach_encoder allows to stop gradient propogation to encoder
-        obs = self.encoder(obs, detach=detach_encoder)
+        if not skip_encoder:
+            obs = self.encoder(obs, detach=detach_encoder)
+
+        if self.naive_augment:
+            obs = augment_latent(obs, strength=self.jitter_strength)
 
         q1 = self.Q1(obs, action)
         q2 = self.Q2(obs, action)
@@ -175,14 +236,14 @@ class Critic(nn.Module):
         if step % log_freq != 0:
             return
 
-        self.encoder.log(L, step, log_freq)
+        # self.encoder.log(L, step, log_freq)
 
-        for k, v in self.outputs.items():
-            L.log_histogram('train_critic/%s_hist' % k, v, step)
+        # for k, v in self.outputs.items():
+        #     L.log_histogram('train_critic/%s_hist' % k, v, step)
 
-        for i in range(3):
-            L.log_param('train_critic/q1_fc%d' % i, self.Q1.trunk[i * 2], step)
-            L.log_param('train_critic/q2_fc%d' % i, self.Q2.trunk[i * 2], step)
+        # for i in range(3):
+        #     L.log_param('train_critic/q1_fc%d' % i, self.Q1.trunk[i * 2], step)
+        #     L.log_param('train_critic/q2_fc%d' % i, self.Q2.trunk[i * 2], step)
 
 
 
